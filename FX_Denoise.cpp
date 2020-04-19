@@ -1,18 +1,19 @@
 #include <stdio.h>
 #include <string.h>
+#include <fstream>
+
+#include <include/OpenImageDenoise/oidn.hpp>
 
 #include "ufoFunctions.h"
 #include "ufoProcess.h"
 #include <vector>
 
-#include <include/OpenImageDenoise/oidn.hpp>
-
 //input ports
 enum 
 {
 	INPUT_COLOR,
-	//INPUT_ALBEDO,
-	//INPUT_NORMAL,
+	INPUT_ALBEDO,
+	INPUT_NORMAL,
 	N_RASTER_IN  // the number of input ports
 };
 
@@ -29,6 +30,8 @@ enum
 	PARAM_HDR,
 	PARAM_SRGB,
 	PARAM_AFFINITY,
+	PARAM_FILTER,  // 0 - RT, 1 - RTLightmap
+	PARAM_COEFFITIENTS_PATH,  // string
 	N_PARAM  // the number of node parameters
 };
 
@@ -39,13 +42,43 @@ enum
 	N_PARAM_GROUP  // number of tabs
 };
 
+enum 
+{
+	FILTER_RT,
+	FILTER_RTLIGHTMAP,
+	N_FILTER
+};
+
 //inner node data structure
 typedef struct 
 {
 	int min_x, min_y, max_x, max_y;
-	size_t width, height;
-	bool use_affinity, is_srgb, is_hdr;
 } ProcessUserData;
+
+//copy from oid
+std::vector<char> loadFile(const std::string& filename, bool &is_correct)
+{
+	std::ifstream file(filename, std::ios::binary);
+	if (file.fail())
+	{
+		is_correct = false;
+		std::vector<char> buffer(0);
+		return buffer;
+	}
+	file.seekg(0, file.end);
+	const size_t size = file.tellg();
+	file.seekg(0, file.beg);
+	std::vector<char> buffer(size);
+	file.read(buffer.data(), size);
+	if (file.fail())
+	{
+		is_correct = false;
+		buffer.resize(0);
+		return buffer;
+	}
+	is_correct = true;
+	return buffer;
+}
 
 std::vector<float> pixels;
 
@@ -56,6 +89,11 @@ std::vector<float> pixels;
 //define node parameters
 ufoProcess ufoProcessDefine(void)
 {
+	//define enumerator
+	char *filter_type[N_FILTER];
+	filter_type[FILTER_RT] = "RT";
+	filter_type[FILTER_RTLIGHTMAP] = "RT Lightmap";
+
 	//initialize the node
 	ufoProcess process_instance = ufoProcessCreate("FX Denoise", N_RASTER_IN, N_RASTER_OUT, N_PARAM, N_PARAM_GROUP);
 
@@ -64,30 +102,36 @@ ufoProcess ufoProcessDefine(void)
 
 	//create input raster
 	ufoProcessRasterInDefine(process_instance, INPUT_COLOR, "InputColor", "Input Color",	ufoRGBCompComb);
-	//ufoProcessRasterInDefine(process_instance, INPUT_ALBEDO, "InputAlbedo", "Input Albedo", ufoRGBCompComb);
-	//ufoProcessRasterInDefine(process_instance, INPUT_NORMAL, "InputNormal", "Input Normal", ufoRGBCompComb);
+	ufoProcessRasterInDefine(process_instance, INPUT_ALBEDO, "InputAlbedo", "Input Albedo", ufoRGBCompComb);
+	ufoProcessRasterInDefine(process_instance, INPUT_NORMAL, "InputNormal", "Input Normal", ufoRGBCompComb);
 
-	//ufoProcessSetRasterInOptional(process_instance, INPUT_ALBEDO, 1);
-	//ufoProcessSetRasterInOptional(process_instance, INPUT_NORMAL, 1);
+	ufoProcessSetRasterInOptional(process_instance, INPUT_ALBEDO, 1);
+	ufoProcessSetRasterInOptional(process_instance, INPUT_NORMAL, 1);
 
 	//create output raster
 	ufoProcessRasterOutDefine(process_instance, OUTPUT,	"Output", "Output", 	ufoRGBCompComb);
 
 	//parameters
-	ufoProcessParamDefine(process_instance,	PARAM_AFFINITY, GROUP_DENOISE,  "Affinity", "Set Affinity", ufoBooleanParam);
-	ufoProcessSetParamDefaultValue(process_instance, PARAM_AFFINITY, ufoDefaultChannelIndex, false);
-
 	ufoProcessParamDefine(process_instance, PARAM_HDR, GROUP_DENOISE, "HDR", "HDR", ufoBooleanParam);
-	ufoProcessSetParamDefaultValue(process_instance, PARAM_HDR, ufoDefaultChannelIndex, false);
+	ufoProcessSetParamDefaultValue(process_instance, PARAM_HDR, ufoDefaultChannelIndex, true);
 
 	ufoProcessParamDefine(process_instance, PARAM_SRGB, GROUP_DENOISE, "SRGB", "sRGB", ufoBooleanParam);
-	ufoProcessSetParamDefaultValue(process_instance, PARAM_SRGB, ufoDefaultChannelIndex, true);
+	ufoProcessSetParamDefaultValue(process_instance, PARAM_SRGB, ufoDefaultChannelIndex, false);
+
+	ufoProcessParamDefine(process_instance, PARAM_AFFINITY, GROUP_DENOISE, "Affinity", "Set Affinity", ufoBooleanParam);
+	ufoProcessSetParamDefaultValue(process_instance, PARAM_AFFINITY, ufoDefaultChannelIndex, false);
+
+	ufoProcessEnumParamDefine(process_instance, PARAM_FILTER, GROUP_DENOISE, "FILTER", "Filter", N_FILTER, filter_type);
+	ufoProcessSetParamAnimAllow(process_instance, PARAM_FILTER, 0);
+
+	ufoProcessParamDefine(process_instance, PARAM_COEFFITIENTS_PATH, GROUP_DENOISE, "WEIGHTS", "Weights Path", ufoStringParam);
+	ufoProcessSetParamAnimAllow(process_instance, PARAM_COEFFITIENTS_PATH, 0);
 	
 	//pixel combination array
 	const int number_combinations = 1;
 	ufoPixelType input_combinations[N_RASTER_IN][1] =
 	{
-		{ ufoRGBFPixelType },
+		{ ufoRGBFPixelType },{ ufoRGBFPixelType },{ ufoRGBFPixelType }
 	};
 
 	ufoPixelType output_combinations[N_RASTER_OUT][1] =
@@ -132,9 +176,17 @@ void ufoProcessPreRender(void *process_instance, int x1, int y1, int x2, int y2)
 	}
 
 	//copy node parameters
-	user_data->is_hdr = ufoProcessGetParamValue(process_instance, PARAM_HDR, ufoDefaultChannelIndex) > 0.5;
-	user_data->is_srgb = ufoProcessGetParamValue(process_instance, PARAM_SRGB, ufoDefaultChannelIndex) > 0.5;
-	user_data->use_affinity = ufoProcessGetParamValue(process_instance, PARAM_AFFINITY, ufoDefaultChannelIndex) > 0.5;
+	bool is_hdr = ufoProcessGetParamValue(process_instance, PARAM_HDR, ufoDefaultChannelIndex) > 0.5;
+	bool is_srgb = ufoProcessGetParamValue(process_instance, PARAM_SRGB, ufoDefaultChannelIndex) > 0.5;
+	bool use_affinity = ufoProcessGetParamValue(process_instance, PARAM_AFFINITY, ufoDefaultChannelIndex) > 0.5;
+	int filter_mode = ufoProcessGetParamValue(process_instance, PARAM_FILTER, ufoDefaultChannelIndex);
+	char *path = ufoProcessGetStringParamValue(process_instance, PARAM_COEFFITIENTS_PATH);
+	bool use_weights = false;
+	std::string weights_path = path;
+	if (weights_path.size() > 0)
+	{
+		use_weights = true;
+	}
 
 	//calculate size of the image
 	int width = x2 - x1 + 1;
@@ -142,21 +194,21 @@ void ufoProcessPreRender(void *process_instance, int x1, int y1, int x2, int y2)
 
 	//read pixels from the input rasters
 	ufoRaster color_in = ufoProcessGetRasterIn(process_instance, INPUT_COLOR);
-	//ufoRaster albedo_in = ufoProcessGetRasterIn(process_instance, INPUT_ALBEDO);
-	//ufoRaster normal_in = ufoProcessGetRasterIn(process_instance, INPUT_NORMAL);
+	ufoRaster albedo_in = ufoProcessGetRasterIn(process_instance, INPUT_ALBEDO);
+	ufoRaster normal_in = ufoProcessGetRasterIn(process_instance, INPUT_NORMAL);
 
 	bool use_albedo = false;
 	bool use_normal = false;
 	std::vector<float> original_albedo;
 	std::vector<float> original_normal;
-	/*if(albedo_in != NULL)
+	if(albedo_in != NULL)
 	{
 		use_albedo = true;
 	}
-	if(normal_in != NULL)
+	if(use_albedo && normal_in != NULL)
 	{
 		use_normal = true;
-	}*/
+	}
 
 	//get pixels pointers
 	ufoPixelRGBF *color_pixel_pt = static_cast<ufoPixelRGBF *>(ufoRasterGetPixelAddress(color_in, x1, y1));
@@ -164,11 +216,11 @@ void ufoProcessPreRender(void *process_instance, int x1, int y1, int x2, int y2)
 	ufoPixelRGBF *normal_pixel_pt = NULL;
 	if(use_albedo)
 	{
-		//albedo_pixel_pt = static_cast<ufoPixelRGBF *>(ufoRasterGetPixelAddress(albedo_in, x1, y1));
+		albedo_pixel_pt = static_cast<ufoPixelRGBF *>(ufoRasterGetPixelAddress(albedo_in, x1, y1));
 	}
 	if(use_normal)
 	{
-		//normal_pixel_pt = static_cast<ufoPixelRGBF *>(ufoRasterGetPixelAddress(normal_in, x1, y1));
+		normal_pixel_pt = static_cast<ufoPixelRGBF *>(ufoRasterGetPixelAddress(normal_in, x1, y1));
 	}
 
 	//fill arrays by pixels values
@@ -188,6 +240,7 @@ void ufoProcessPreRender(void *process_instance, int x1, int y1, int x2, int y2)
 	int index = 0;
 	for (int y = y1; y <= y2; y++)
 	{
+		//int index = pixels.size() - 3*width * (row + 1);
 		for (int x = x1; x <= x2; x++)
 		{
 			//read red channel
@@ -224,9 +277,9 @@ void ufoProcessPreRender(void *process_instance, int x1, int y1, int x2, int y2)
 			{
 				original_normal[index] = normal_pixel_pt->blue_;
 			}
+			index++;
 
 			//increase iterators
-			index++;
 			color_pixel_pt++;
 			if (use_albedo)
 			{
@@ -242,10 +295,23 @@ void ufoProcessPreRender(void *process_instance, int x1, int y1, int x2, int y2)
 	//start denoising
 	//1. create device
 	oidn::DeviceRef device = oidn::newDevice();
-	device.set("setAffinity", user_data->use_affinity);
+	device.set("setAffinity", use_affinity);
 	device.commit();
 	//2. add filter
-	oidn::FilterRef filter = device.newFilter("RT");
+	std::vector<char> weights;
+	if (use_weights && !weights_path.empty())
+	{
+		bool is_correct = false;
+		weights = loadFile(weights_path, is_correct);
+		if (!is_correct)
+		{
+			use_weights = false;
+			weights.clear();
+			weights.shrink_to_fit();
+		}
+	}
+
+	oidn::FilterRef filter = filter_mode == 1 ? device.newFilter("RTLightmap") : device.newFilter("RT");
 	filter.setImage("color", original_pixels.data(), oidn::Format::Float3, width, height);
 	if(use_albedo)
 	{
@@ -256,8 +322,12 @@ void ufoProcessPreRender(void *process_instance, int x1, int y1, int x2, int y2)
 		filter.setImage("normal", original_normal.data(), oidn::Format::Float3, width, height);
 	}
 	filter.setImage("output", pixels.data(), oidn::Format::Float3, width, height);
-	filter.set("hdr", user_data->is_hdr);
-	filter.set("srgb", user_data->is_srgb);
+	filter.set("hdr", is_hdr);
+	filter.set("srgb", is_srgb);
+	if (use_weights && !weights.empty())
+	{
+		filter.setData("weights", weights.data(), weights.size());
+	}
 	filter.commit();
 	//3. execute
 	filter.execute();
@@ -273,9 +343,6 @@ void ufoProcessPreRender(void *process_instance, int x1, int y1, int x2, int y2)
 	user_data->min_y = y1;
 	user_data->max_x = x2;
 	user_data->max_y = y2;
-
-	user_data->width = width;
-	user_data->height = height;
 	
 	ufoProcessSetUserData(process_instance, static_cast<void*>(user_data));
 }
