@@ -2,7 +2,7 @@
 #include <string.h>
 #include <fstream>
 
-#include <include/OpenImageDenoise/oidn.hpp>
+#include <OpenImageDenoise/oidn.hpp>
 
 #include "ufoFunctions.h"
 #include "ufoProcess.h"
@@ -30,7 +30,9 @@ enum
 	PARAM_HDR,
 	PARAM_SRGB,
 	PARAM_AFFINITY,
-	PARAM_FILTER,  // 0 - RT, 1 - RTLightmap
+	//PARAM_FILTER,  // 0 - RT, 1 - RTLightmap
+	PARAM_CLEAN_SECONDARY_MAPS,
+	//PARAM_PREFILTER_SECONDARY_MAPS,
 	PARAM_COEFFITIENTS_PATH,  // string
 	N_PARAM  // the number of node parameters
 };
@@ -121,8 +123,14 @@ ufoProcess ufoProcessDefine(void)
 	ufoProcessParamDefine(process_instance, PARAM_AFFINITY, GROUP_DENOISE, "Affinity", "Set Affinity", ufoBooleanParam);
 	ufoProcessSetParamDefaultValue(process_instance, PARAM_AFFINITY, ufoDefaultChannelIndex, false);
 
-	ufoProcessEnumParamDefine(process_instance, PARAM_FILTER, GROUP_DENOISE, "FILTER", "Filter", N_FILTER, filter_type);
-	ufoProcessSetParamAnimAllow(process_instance, PARAM_FILTER, 0);
+	ufoProcessParamDefine(process_instance, PARAM_CLEAN_SECONDARY_MAPS, GROUP_DENOISE, "CleanSecondaryMaps", "Clean Secondary Maps", ufoBooleanParam);
+	ufoProcessSetParamDefaultValue(process_instance, PARAM_CLEAN_SECONDARY_MAPS, ufoDefaultChannelIndex, false);
+
+	//ufoProcessParamDefine(process_instance, PARAM_PREFILTER_SECONDARY_MAPS, GROUP_DENOISE, "PrefileterSecondaryMaps", "Prefilter Secondary Maps", ufoBooleanParam);
+	//ufoProcessSetParamDefaultValue(process_instance, PARAM_PREFILTER_SECONDARY_MAPS, ufoDefaultChannelIndex, true);
+
+	//ufoProcessEnumParamDefine(process_instance, PARAM_FILTER, GROUP_DENOISE, "FILTER", "Filter", N_FILTER, filter_type);
+	//ufoProcessSetParamAnimAllow(process_instance, PARAM_FILTER, 0);
 
 	ufoProcessParamDefine(process_instance, PARAM_COEFFITIENTS_PATH, GROUP_DENOISE, "WEIGHTS", "Weights Path", ufoStringParam);
 	ufoProcessSetParamAnimAllow(process_instance, PARAM_COEFFITIENTS_PATH, 0);
@@ -179,7 +187,9 @@ void ufoProcessPreRender(void *process_instance, int x1, int y1, int x2, int y2)
 	bool is_hdr = ufoProcessGetParamValue(process_instance, PARAM_HDR, ufoDefaultChannelIndex) > 0.5;
 	bool is_srgb = ufoProcessGetParamValue(process_instance, PARAM_SRGB, ufoDefaultChannelIndex) > 0.5;
 	bool use_affinity = ufoProcessGetParamValue(process_instance, PARAM_AFFINITY, ufoDefaultChannelIndex) > 0.5;
-	int filter_mode = ufoProcessGetParamValue(process_instance, PARAM_FILTER, ufoDefaultChannelIndex);
+	bool clean_secondary = ufoProcessGetParamValue(process_instance, PARAM_CLEAN_SECONDARY_MAPS, ufoDefaultChannelIndex) > 0.5;  // if true, then albedo and normal are clean and we should't run prefiltering
+	//bool prefilter_secondary = ufoProcessGetParamValue(process_instance, PARAM_PREFILTER_SECONDARY_MAPS, ufoDefaultChannelIndex) > 0.5;
+	//int filter_mode = ufoProcessGetParamValue(process_instance, PARAM_FILTER, ufoDefaultChannelIndex);
 	char *path = ufoProcessGetStringParamValue(process_instance, PARAM_COEFFITIENTS_PATH);
 	bool use_weights = false;
 	std::string weights_path = path;
@@ -311,7 +321,8 @@ void ufoProcessPreRender(void *process_instance, int x1, int y1, int x2, int y2)
 		}
 	}
 
-	oidn::FilterRef filter = filter_mode == 1 ? device.newFilter("RTLightmap") : device.newFilter("RT");
+	//oidn::FilterRef filter = filter_mode == 1 ? device.newFilter("RTLightmap") : device.newFilter("RT");
+	oidn::FilterRef filter = device.newFilter("RT");  // use RT by default
 	filter.setImage("color", original_pixels.data(), oidn::Format::Float3, width, height);
 	if(use_albedo)
 	{
@@ -324,12 +335,38 @@ void ufoProcessPreRender(void *process_instance, int x1, int y1, int x2, int y2)
 	filter.setImage("output", pixels.data(), oidn::Format::Float3, width, height);
 	filter.set("hdr", is_hdr);
 	filter.set("srgb", is_srgb);
+	filter.set("cleanAux", true);
 	if (use_weights && !weights.empty())
 	{
 		filter.setData("weights", weights.data(), weights.size());
 	}
+	//prepare secondary filters
+	oidn::FilterRef albedo_filter;
+	oidn::FilterRef normal_filter;
+	if (!clean_secondary && use_albedo)
+	{
+		albedo_filter = device.newFilter("RT"); // same filter type as for beauty
+		albedo_filter.setImage("albedo", original_albedo.data(), oidn::Format::Float3, width, height);
+		albedo_filter.setImage("output", original_albedo.data(), oidn::Format::Float3, width, height);
+		albedo_filter.commit();
+	}
+	if (!clean_secondary && use_normal)
+	{
+		normal_filter = device.newFilter("RT"); // same filter type as for beauty
+		normal_filter.setImage("normal", original_albedo.data(), oidn::Format::Float3, width, height);
+		normal_filter.setImage("output", original_albedo.data(), oidn::Format::Float3, width, height);
+		normal_filter.commit();
+	}
 	filter.commit();
 	//3. execute
+	if (!clean_secondary && use_albedo)
+	{
+		albedo_filter.execute();
+	}
+	if (!clean_secondary && use_normal)
+	{
+		normal_filter.execute();
+	}
 	filter.execute();
 	//4. clear original pixels
 	original_pixels.clear();
